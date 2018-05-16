@@ -2,10 +2,12 @@
 import arcpy
 import os
 import re
+import pandas as pd
 
 # Set input and output directories here
-inws = r'E:\DLG\gdb'
-outws = r'E:\DLG\gdb1'
+inws1 = r'E:\DLG\gdb_ds' # directory for gdbs with datasets in them, but no feature class directly in them.
+inws2 = r'E:\DLG\gdb'    # directory for gdbs without datasets in them, only feature classes directly in them.
+outws = r'E:\DLG\gdb_merge'
 pattern_gdb = re.compile(".gdb$")
 
 # helper functions
@@ -31,54 +33,76 @@ def locate_dir(pattern, root= "."):
             if re.search(pattern, d):
                 yield os.path.join(path, d)
 
+def getDomainUnion(gdb_dss):
+    """
+    Get the union of all the sr.domain of all datasets in every gdb_dss.
+    
+    Arg: a list of gdbs.
+    Return: a tuple of (xmin, ymin, xmax, ymax)
+    
+    """
+    li_domain = []
+    for g in gdb_dss:
+        arcpy.env.workspace = os.path.join(inws1, g)
+        dss = arcpy.ListDatasets()
+        for ds in dss:
+            desc = arcpy.Describe(ds)
+            sr = desc.spatialReference
+            # Notice that sr.domain get a string of (xmin, ymin, xmax, ymax) separated by space.
+            li_domain.append([float(x) for x in sr.domain.split(" ")])
 
-gdbs = [] # store all mdb files' absolut path.
-for g in locate_dir(pattern_gdb, root=inws):
-    gdbs.append(g)
+    df = pd.DataFrame(li_domain)
+    # Return min of xmin, ymin and max of xmax, ymax
+    return (df.iloc[:, 0].min(), df.iloc[:, 1].min(), df.iloc[:, 2].max(), df.iloc[:, 3].max()) 
 
-# The following codes modified from https://gis.stackexchange.com/questions/156708/copying-feature-classes-from-personal-geodatabase-to-file-geodatabase-using-arcp
+gdb_dss = [] # store all mdb files' absolut path.
+for g in locate_dir(pattern_gdb, root=inws1):
+    gdb_dss.append(g)
+
 # Define output FGDB name
 fgdb_name = "merged.gdb"
-# print("New file geodatabase:", fgdb_name)
 
 # Create a new FGDB, make sure this file geodatabase dosn't exist when running this script.
 arcpy.CreateFileGDB_management(outws, fgdb_name)
 
-count = 0
-for g in gdbs:
-    # Create a dict, with keys of feature class names directly in file geodatabases.
-    direct_fcs = {}
+xmin, ymin, xmax, ymax = getDomainUnion(gdb_dss)
 
-    # Add any FCs that are directly in file geodatabase to the dict.
-    arcpy.env.workspace = os.path.join(inws, g)  
-    fcs = arcpy.ListFeatureClasses()
-    for fc in fcs:
-        direct_fcs.get(fc, []).append(os.path.join(inws, g, fc))
-        # print("Feature class directly in file geodatabase: ", fc)
+g = gdb_dss[0]
+arcpy.env.workspace = os.path.join(inws1, g)
+dss = arcpy.ListDatasets()
+for ds in dss:
+    desc = arcpy.Describe(ds)
+    sr = desc.spatialReference
+    
+    # http://pro.arcgis.com/zh-cn/pro-app/arcpy/classes/spatialreference.htm
+    # update the domain of x and y to the union of all feature classes from every gdbs.
+    # Notice that when we set the domain of spatialReference, the sequence is: xmin, xmax, ymin, ymax, which is different
+    # from the sequence what we get from sr.domain. setDomain (x_min, x_max, y_min, y_max) 
+    sr.setDomain(xmin, xmax, ymin, ymax)
+    
+    # Create datasets in target file geodataset with the same spatial reference and name as from the input geodatabases.
+    arcpy.CreateFeatureDataset_management(os.path.join(outws, fgdb_name), ds, spatial_reference=sr)
 
-    # List the feature dataset, directly in personal geodatabase
-    arcpy.env.workspace = os.path.join(inws, g)
-    fds = arcpy.ListDatasets()
-    for f in fds:
-        # print("Dataset: ", f)
-        # Reset the working space to personal geodatabase, which maybe changed to last dataset in last loop.
-        arcpy.env.workspace = os.path.join(inws, g) 
-        # Determine FDS spatial reference
-        desc = arcpy.Describe(f)
-        sr = desc.spatialReference
-        # print("Spatial reference: ", sr)
-
-        # Copy FDS to FGDB, create dataset in file geodataset with the same spatial reference
-        arcpy.CreateFeatureDataset_management(os.path.join(outws, fgdb_name), f, spatial_reference = sr)
-
-        # Copy the FCs to new FDS
-        arcpy.env.workspace = os.path.join(inws, g, f) # set workspace to the dataset in input personal geodatabase
-        # print("Workspace directly in dataset: ", arcpy.env.workspace)
-        fcs = arcpy.ListFeatureClasses()
-        for fc in fcs:
-            arcpy.CopyFeatures_management(fc, os.path.join(outws, fgdb_name, f, fc))
-            # print("Feature class: ", fc)
+# A dictionary with keys of feature classes, and values of lists of absolute path of feature classes.
+indirect_fcs = {}
+for ds in dss:
+    for g in gdb_dss:
+        # Reset the working space to file geodatabase, which maybe changed to last dataset in last loop.
+        arcpy.env.workspace = os.path.join(inws1, g) 
         
-    # Report on processing status
-    print("%s of %s personal databases converted to FGDB" % (count, len(gdbs)))
-    count += 1
+        # set workspace to the dataset in each input file geodatabase
+        arcpy.env.workspace = os.path.join(inws1, g, ds) 
+        fcs = arcpy.ListFeatureClasses()
+        if fcs is not None:
+            # print(arcpy.env.workspace, "Number of feature classes: ", len(fcs))
+            for fc in fcs:
+                try:
+                    indirect_fcs[fc].append(os.path.join(inws1, g, ds, fc))
+                except:
+                    indirect_fcs[fc] = [os.path.join(inws1, g, ds, fc)]            
+        else:
+            print(arcpy.env.workspace, "Number of feature classes: 0")
+
+# Merge all feature classes with the same feature class names (in the same keys).
+for k in indirect_fcs:
+    arcpy.Merge_management(indirect_fcs[k], os.path.join(outws, fgdb_name, dss[0], k))
